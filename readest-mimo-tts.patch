@@ -1,0 +1,317 @@
+diff --git a/apps/readest-app/src/utils/access.ts b/apps/readest-app/src/utils/access.ts
+index 014959f..6373107 100644
+--- a/apps/readest-app/src/utils/access.ts
++++ b/apps/readest-app/src/utils/access.ts
+@@ -213,8 +213,15 @@ export const isCustomTranslatorAllowed = (token: string | null | undefined): boo
+  * Custom TTS services (the user's own OpenAI-compatible speech endpoint) are
+  * premium on the same terms as custom translators: requests go straight from
+  * the device, so this is a client-side gate.
++ *
++ * The desktop app is exempt. A service there is the user's own key against the
++ * user's own endpoint, carried by the Tauri HTTP client rather than the webview,
++ * and the build sells no unlock the gate would protect.
+  */
+-export const isCustomTTSAllowed = isCustomTranslatorAllowed;
++export const isCustomTTSAllowed = (
++  token: string | null | undefined,
++  { isDesktopApp = false }: { isDesktopApp?: boolean } = {},
++): boolean => isDesktopApp || isCustomTranslatorAllowed(token);
+ 
+ export const STORAGE_QUOTA_GRACE_BYTES = 10 * 1024 * 1024; // 10 MB grace
+ 
+diff --git a/apps/readest-app/src/components/settings/TTSPanel.tsx b/apps/readest-app/src/components/settings/TTSPanel.tsx
+index e829aae..350adf7 100644
+--- a/apps/readest-app/src/components/settings/TTSPanel.tsx
++++ b/apps/readest-app/src/components/settings/TTSPanel.tsx
+@@ -39,7 +39,7 @@ const TTSPanel: React.FC<SettingsPanelPanelProp> = ({ bookKey, onRegisterReset }
+   const { envConfig, appService } = useEnv();
+   const router = useAppRouter();
+   const { token, user } = useAuth();
+-  const hasPremium = isCustomTTSAllowed(token);
++  const hasPremium = isCustomTTSAllowed(token, { isDesktopApp: !!appService?.isDesktopApp });
+   const [showCustomServices, setShowCustomServices] = useState(false);
+   const [showVoices, setShowVoices] = useState(false);
+   const [voiceLibrary, setVoiceLibrary] = useState<VoiceLibrary | null>(null);
+diff --git a/apps/readest-app/src/components/settings/CustomTTSServices.tsx b/apps/readest-app/src/components/settings/CustomTTSServices.tsx
+index 256ab24..fdffd52 100644
+--- a/apps/readest-app/src/components/settings/CustomTTSServices.tsx
++++ b/apps/readest-app/src/components/settings/CustomTTSServices.tsx
+@@ -2,7 +2,9 @@ import React, { useEffect, useState } from 'react';
+ import { useEnv } from '@/context/EnvContext';
+ import { useTranslation } from '@/hooks/useTranslation';
+ import { useKeyDownActions } from '@/hooks/useKeyDownActions';
++import { MIMO_TTS_PRESET } from '@/services/tts/providers/openaiCompatible';
+ import { ensureCustomTTSServicesLoaded, useCustomTTSStore } from '@/store/customTTSStore';
++import type { CustomTTSService } from '@/types/customTTS';
+ import { BoxedList, NavigationRow } from './primitives';
+ import { AddButton } from './CustomTranslators';
+ import SubPageHeader from './SubPageHeader';
+@@ -10,13 +12,20 @@ import CustomTTSServiceEditor from './CustomTTSServiceEditor';
+ 
+ // undefined: the list; null: a new service; a string: that service.
+ type Editing = string | null | undefined;
++// The fields a preset fills in; the key is the only thing left to type.
++type Preset = Pick<CustomTTSService, 'name' | 'baseUrl' | 'model'>;
+ 
+ const CustomTTSServices: React.FC<{ onBack: () => void }> = ({ onBack }) => {
+   const _ = useTranslation();
+   const { envConfig } = useEnv();
+   const [editing, setEditing] = useState<Editing>(undefined);
++  const [preset, setPreset] = useState<Preset | undefined>(undefined);
+   const services = useCustomTTSStore((s) => s.services).filter((s) => !s.deletedAt);
+   const backToList = () => setEditing(undefined);
++  const startNew = (presetFields?: Preset) => {
++    setPreset(presetFields);
++    setEditing(null);
++  };
+ 
+   useEffect(() => {
+     ensureCustomTTSServicesLoaded(envConfig);
+@@ -30,6 +39,7 @@ const CustomTTSServices: React.FC<{ onBack: () => void }> = ({ onBack }) => {
+       <CustomTTSServiceEditor
+         key={editing ?? 'new'}
+         service={services.find((s) => s.id === editing)}
++        preset={editing === null ? preset : undefined}
+         onBack={backToList}
+       />
+     );
+@@ -58,8 +68,12 @@ const CustomTTSServices: React.FC<{ onBack: () => void }> = ({ onBack }) => {
+             ))}
+           </BoxedList>
+         )}
+-        <div className='grid grid-cols-1'>
+-          <AddButton label={_('Add TTS Service')} onClick={() => setEditing(null)} />
++        <div className='grid grid-cols-1 gap-2'>
++          <AddButton label={_('Add TTS Service')} onClick={() => startNew()} />
++          <AddButton
++            label={`${_('Add')} ${MIMO_TTS_PRESET.name}`}
++            onClick={() => startNew(MIMO_TTS_PRESET)}
++          />
+         </div>
+       </div>
+     </div>
+diff --git a/apps/readest-app/src/components/settings/CustomTTSServiceEditor.tsx b/apps/readest-app/src/components/settings/CustomTTSServiceEditor.tsx
+index 0477b84..4bcf4df 100644
+--- a/apps/readest-app/src/components/settings/CustomTTSServiceEditor.tsx
++++ b/apps/readest-app/src/components/settings/CustomTTSServiceEditor.tsx
+@@ -5,6 +5,7 @@ import { useTranslation } from '@/hooks/useTranslation';
+ import { useCustomTTSStore } from '@/store/customTTSStore';
+ import {
+   isMiMoService,
++  MIMO_TTS_PRESET,
+   OpenAICompatibleSpeechProvider,
+   speechEndpoint,
+ } from '@/services/tts/providers/openaiCompatible';
+@@ -22,9 +23,10 @@ const BASE_URL_PRESETS = [
+   'https://api.openai.com/v1',
+   'https://api.siliconflow.cn/v1',
+   'http://127.0.0.1:8880/v1',
++  MIMO_TTS_PRESET.baseUrl,
+ ];
+ 
+-const MODEL_PRESETS = ['gpt-4o-mini-tts', 'tts-1', 'tts-1-hd', 'kokoro'];
++const MODEL_PRESETS = ['gpt-4o-mini-tts', 'tts-1', 'tts-1-hd', 'kokoro', MIMO_TTS_PRESET.model];
+ 
+ type Draft = Omit<CustomTTSService, 'id' | 'addedAt' | 'updatedAt'>;
+ 
+@@ -43,14 +45,20 @@ const Field: React.FC<{ id: string; label: string; children: React.ReactNode }>
+ 
+ interface CustomTTSServiceEditorProps {
+   service?: CustomTTSService;
++  /** What a new service starts from (a preset fills all but its key). */
++  preset?: Pick<CustomTTSService, 'name' | 'baseUrl' | 'model'>;
+   onBack: () => void;
+ }
+ 
+-const CustomTTSServiceEditor: React.FC<CustomTTSServiceEditorProps> = ({ service, onBack }) => {
++const CustomTTSServiceEditor: React.FC<CustomTTSServiceEditorProps> = ({
++  service,
++  preset,
++  onBack,
++}) => {
+   const _ = useTranslation();
+   const { envConfig } = useEnv();
+   const [draft, setDraft] = useState<Draft>(
+-    service ?? { name: '', baseUrl: BASE_URL_PRESETS[0]!, model: MODEL_PRESETS[0]! },
++    service ?? preset ?? { name: '', baseUrl: BASE_URL_PRESETS[0]!, model: MODEL_PRESETS[0]! },
+   );
+   const [testing, setTesting] = useState(false);
+   const [error, setError] = useState('');
+@@ -135,7 +143,7 @@ const CustomTTSServiceEditor: React.FC<CustomTTSServiceEditorProps> = ({ service
+     <div className='my-4 w-full space-y-6'>
+       <SubPageHeader
+         parentLabel={_('Custom TTS Services')}
+-        currentLabel={service ? service.name : _('Add TTS Service')}
++        currentLabel={service?.name ?? preset?.name ?? _('Add TTS Service')}
+         description={_(
+           'Use your own API key with an OpenAI-compatible speech service. Requests go directly from this device to the service.',
+         )}
+diff --git a/apps/readest-app/src/services/tts/TTSController.ts b/apps/readest-app/src/services/tts/TTSController.ts
+index b56a693..82930b2 100644
+--- a/apps/readest-app/src/services/tts/TTSController.ts
++++ b/apps/readest-app/src/services/tts/TTSController.ts
+@@ -325,7 +325,8 @@ export class TTSController extends EventTarget {
+     );
+     const customProvider = new OpenAICompatibleSpeechProvider(
+       () => this.#customTTSServices(),
+-      async () => isCustomTTSAllowed(await getAccessToken()),
++      async () =>
++        isCustomTTSAllowed(await getAccessToken(), { isDesktopApp: !!appService?.isDesktopApp }),
+     );
+     this.ttsCustomClient = new BufferedTTSClient(
+       cacheStore ? new CachingProvider(customProvider, cacheStore) : customProvider,
+diff --git a/apps/readest-app/src/services/tts/providers/openaiCompatible.ts b/apps/readest-app/src/services/tts/providers/openaiCompatible.ts
+index d34bcbe..d848af9 100644
+--- a/apps/readest-app/src/services/tts/providers/openaiCompatible.ts
++++ b/apps/readest-app/src/services/tts/providers/openaiCompatible.ts
+@@ -43,6 +43,16 @@ const MIMO_VOICES: ListedVoice[] = [
+   ...['Mia', 'Chloe', 'Milo', 'Dean'].map((name) => ({ name, lang: 'en-US' })),
+ ];
+ 
++// Everything a MiMo service needs besides its key: the endpoint is fixed and
++// this is the model the voices above belong to. Its voices then list
++// themselves, so an added service is complete once the key is pasted in.
++// https://mimo.mi.com/docs/en-US/api/audio/tts
++export const MIMO_TTS_PRESET: Pick<CustomTTSService, 'name' | 'baseUrl' | 'model'> = {
++  name: 'MiMo TTS',
++  baseUrl: 'https://api.xiaomimimo.com/v1',
++  model: 'mimo-v2.5-tts',
++};
++
+ // MiMo serves speech only from chat completions, so any service on its host
+ // (whatever the model) uses them; a proxy elsewhere keeps the OpenAI route.
+ export const isMiMoService = (service: Pick<CustomTTSService, 'baseUrl'>): boolean => {
+diff --git a/apps/readest-app/src/__tests__/utils/access-tts.test.ts b/apps/readest-app/src/__tests__/utils/access-tts.test.ts
+index cc97459..60bd610 100644
+--- a/apps/readest-app/src/__tests__/utils/access-tts.test.ts
++++ b/apps/readest-app/src/__tests__/utils/access-tts.test.ts
+@@ -1,6 +1,20 @@
+ // @vitest-environment node
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+-import { getTTSQuota, isTTSInPlan, isVoiceTierInPlan, TTS_PLANS } from '@/utils/access';
++import { jwtDecode } from 'jwt-decode';
++import {
++  getTTSQuota,
++  isCustomTTSAllowed,
++  isTTSInPlan,
++  isVoiceTierInPlan,
++  TTS_PLANS,
++} from '@/utils/access';
++
++vi.mock('jwt-decode', () => ({ jwtDecode: vi.fn() }));
++
++const tokenFor = (claims: Record<string, unknown>) => {
++  (jwtDecode as unknown as ReturnType<typeof vi.fn>).mockReturnValue(claims);
++  return 'token';
++};
+ 
+ describe('TTS plan gating', () => {
+   it('includes exactly plus and pro', () => {
+@@ -39,3 +53,23 @@ describe('getTTSQuota', () => {
+     expect(getTTSQuota('free')).toBe(12345);
+   });
+ });
++
++// The desktop app carries custom speech requests itself and sells no unlock,
++// so its services are open; the web and mobile paywalls are untouched.
++describe('isCustomTTSAllowed', () => {
++  afterEach(() => vi.unstubAllEnvs());
++
++  it('unlocks the desktop app with no account at all', () => {
++    expect(isCustomTTSAllowed(null, { isDesktopApp: true })).toBe(true);
++  });
++
++  it('keeps the gate wherever the flag is false or absent', () => {
++    expect(isCustomTTSAllowed(null)).toBe(false);
++    expect(isCustomTTSAllowed(null, { isDesktopApp: false })).toBe(false);
++    expect(isCustomTTSAllowed(tokenFor({ plan: 'free' }), { isDesktopApp: false })).toBe(false);
++  });
++
++  it('still reads the plan of a signed-in reader', () => {
++    expect(isCustomTTSAllowed(tokenFor({ plan: 'plus' }))).toBe(true);
++  });
++});
+diff --git a/apps/readest-app/src/__tests__/components/settings/CustomTTSServiceEditor.test.tsx b/apps/readest-app/src/__tests__/components/settings/CustomTTSServiceEditor.test.tsx
+index f4518af..7540eee 100644
+--- a/apps/readest-app/src/__tests__/components/settings/CustomTTSServiceEditor.test.tsx
++++ b/apps/readest-app/src/__tests__/components/settings/CustomTTSServiceEditor.test.tsx
+@@ -19,6 +19,7 @@ vi.mock('@/hooks/useTranslation', () => ({
+ vi.mock('@/context/EnvContext', () => ({ useEnv: () => ({ envConfig: {} }) }));
+ 
+ import CustomTTSServiceEditor from '@/components/settings/CustomTTSServiceEditor';
++import { MIMO_TTS_PRESET } from '@/services/tts/providers/openaiCompatible';
+ import type { CustomTTSService } from '@/types/customTTS';
+ 
+ const service: CustomTTSService = {
+@@ -81,4 +82,23 @@ describe('CustomTTSServiceEditor', () => {
+       'https://api.xiaomimimo.com/v1/chat/completions',
+     );
+   });
++
++  it('starts from the MiMo preset with only its key left to type', () => {
++    render(<CustomTTSServiceEditor preset={MIMO_TTS_PRESET} onBack={vi.fn()} />);
++    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('MiMo TTS');
++    expect((screen.getByLabelText('Base URL') as HTMLInputElement).value).toBe(
++      'https://api.xiaomimimo.com/v1',
++    );
++    expect((screen.getByLabelText('Model') as HTMLInputElement).value).toBe('mimo-v2.5-tts');
++    // MiMo answers only in MP3, so the format choice stays hidden.
++    expect(screen.queryByLabelText('Format')).toBeNull();
++    fireEvent.click(screen.getByText('Save'));
++    expect(store.addService).toHaveBeenCalledWith(
++      expect.objectContaining({
++        name: 'MiMo TTS',
++        baseUrl: 'https://api.xiaomimimo.com/v1',
++        model: 'mimo-v2.5-tts',
++      }),
++    );
++  });
+ });
+diff --git a/apps/readest-app/src/__tests__/components/settings/CustomTTSServices.test.tsx b/apps/readest-app/src/__tests__/components/settings/CustomTTSServices.test.tsx
+new file mode 100644
+index e69de29..3065cf0 100644
+--- /dev/null
++++ b/apps/readest-app/src/__tests__/components/settings/CustomTTSServices.test.tsx
+@@ -0,0 +1,42 @@
++// @vitest-environment happy-dom
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { cleanup, fireEvent, render, screen } from '@testing-library/react';
++
++const store = vi.hoisted(() => ({ services: [] as unknown[] }));
++vi.mock('@/store/customTTSStore', () => ({
++  useCustomTTSStore: (selector: (state: { services: unknown[] }) => unknown) => selector(store),
++  ensureCustomTTSServicesLoaded: vi.fn(),
++}));
++vi.mock('@/hooks/useTranslation', () => ({ useTranslation: () => (s: string) => s }));
++vi.mock('@/context/EnvContext', () => ({ useEnv: () => ({ envConfig: {} }) }));
++vi.mock('@/hooks/useKeyDownActions', () => ({ useKeyDownActions: vi.fn() }));
++// The real AddButton drags in the translator pages; this test is the preset.
++vi.mock('@/components/settings/CustomTranslators', () => ({
++  AddButton: ({ label, onClick }: { label: string; onClick: () => void }) => (
++    <button type='button' onClick={onClick}>
++      {label}
++    </button>
++  ),
++}));
++
++import CustomTTSServices from '@/components/settings/CustomTTSServices';
++
++afterEach(cleanup);
++
++describe('CustomTTSServices', () => {
++  it('opens a MiMo service prefilled from its preset', () => {
++    render(<CustomTTSServices onBack={vi.fn()} />);
++    fireEvent.click(screen.getByText('Add MiMo TTS'));
++    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('MiMo TTS');
++    expect((screen.getByLabelText('Base URL') as HTMLInputElement).value).toBe(
++      'https://api.xiaomimimo.com/v1',
++    );
++    expect((screen.getByLabelText('Model') as HTMLInputElement).value).toBe('mimo-v2.5-tts');
++  });
++
++  it('opens an empty form from the plain add button', () => {
++    render(<CustomTTSServices onBack={vi.fn()} />);
++    fireEvent.click(screen.getByText('Add TTS Service'));
++    expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('');
++  });
++});
