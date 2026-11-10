@@ -1,0 +1,92 @@
+# 用法：把本文件放到 fork 仓库的 .github/workflows/build-windows-installer.yml，
+# 把 readest-mimo-tts.patch 放到仓库根目录，然后在 Actions 页面点 Run workflow。
+# 不需要任何仓库密钥；构建出的安装包未签名（SmartScreen 会提示一次）。
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch:
+        description: '仓库根目录下的补丁文件名（留空则直接按当前源码构建）'
+        required: false
+        default: 'readest-mimo-tts.patch'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply the MiMo TTS patch
+        shell: pwsh
+        run: |
+          $patch = "${{ inputs.patch }}"
+          if ([string]::IsNullOrWhiteSpace($patch)) {
+            Write-Host 'No patch requested; building the sources as they are.'
+            exit 0
+          }
+          if (-not (Test-Path $patch)) {
+            throw "Patch not found at repo root: $patch"
+          }
+          $provider = 'apps/readest-app/src/services/tts/providers/openaiCompatible.ts'
+          if (Select-String -Path $provider -Pattern 'MIMO_TTS_PRESET' -Quiet) {
+            Write-Host 'Patch already applied; nothing to do.'
+            exit 0
+          }
+          git apply --whitespace=nowarn $patch
+          Write-Host "Applied $patch"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+
+      - name: Setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Copies pdf.js and simplecc vendor assets into the app (release.yml does this too).
+      - name: Copy vendor assets
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64-cargo
+
+      # tauri.windows.conf.json bundles this DLL as a resource, and it is gitignored,
+      # so it has to exist before bundling.
+      - name: Build Windows thumbnail provider
+        run: |
+          cargo build --release --manifest-path apps/readest-app/extensions/windows-thumbnail/Cargo.toml
+          Copy-Item `
+            apps/readest-app/extensions/windows-thumbnail/target/release/windows_thumbnail.dll `
+            apps/readest-app/extensions/windows-thumbnail/target/windows_thumbnail.dll
+
+      # The Next.js export (`pnpm build`) runs from tauri.conf.json's beforeBuildCommand.
+      - name: Build the installer
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: readest-windows-installer
+          path: apps/readest-app/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
